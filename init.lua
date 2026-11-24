@@ -2,10 +2,12 @@
 -- Neovim's terminal-normal mode does.
 --
 -- In rift a terminal buffer is only what's on screen, and it's rewritten
--- whenever the shell prints something. So Alt+a (`buffer_key`) pages through
+-- whenever the shell prints something. So Alt+a (`buffer_key`) in
+-- terminal-normal mode (Alt+a twice, if it's also what leaves terminal mode)
+-- pages through
 -- the history, copies it into a scratch buffer and shows that in the
--- terminal's window. Every motion, search, Visual mode and yank works there
--- because it's an ordinary buffer. `i` (or anything else that enters Insert
+-- terminal's window, updating it as the shell prints more. Every motion,
+-- search, Visual mode and yank works there because it's an ordinary buffer. `i` (or anything else that enters Insert
 -- mode) goes back to the live terminal and deletes the copy.
 --
 -- Leaving terminal mode with rift's own <C-\> doesn't make a copy. For that,
@@ -19,9 +21,11 @@ local M = {}
 local defaults = {
   -- `k` on the top row and `j` on the bottom row scroll the history.
   edge_scroll = true,
-  -- Opens the history as a buffer, from terminal and terminal-normal mode.
+  -- Opens the history as a buffer, from terminal-normal mode.
   -- false to disable.
   buffer_key = "<A-a>",
+  -- How often the open copy is brought up to date, in milliseconds.
+  update_ms = 100,
   -- More terminal-normal maps, key -> action. Set a key to false to drop it.
   keys = {
     ["<C-y>"] = "terminal:scroll_up",
@@ -90,18 +94,52 @@ function M.bottom() jump(1) end
 ---------------------------------------------------------------------------
 
 local HISTORY = 10000 -- alacritty's default, which rift uses
+local PEEK = "termscroll.peek"
 
-local views = {} -- copy's buffer id -> terminal's buffer id
-local cap        -- the capture in progress
+-- The open copy, or nil. buf, term: buffer ids. hist: the lines above the
+-- terminal's screen, which never change again. screen: the screen's lines.
+-- lines: what's in the copy (hist, then the screen).
+local view
+local cap                -- the sync in progress
+local update_ms = 100
+local mode = "normal"    -- from ModeChanged, which tells operator-pending apart
+local hold               -- timer id while syncing waits
 
 local function run(name)
   rift.exec_action(string.format("editor:run:lua _rift_commands[%q].fn({})", name))
 end
 
+-- Reading the terminal. rift refreshes a terminal's text only while it's
+-- shown in a window, or when a scroll action runs in it; and a scroll action
+-- draws a frame. So: switch to the terminal, scroll, and switch back at the
+-- start of that frame, before anything is drawn. A cursor-enter hook is what
+-- runs there: the annotation is new each time, so the cursor always "enters"
+-- it. Events like CursorMoved would work too, but other plugins listen to
+-- those.
+--
+-- Each hook uses up one of rift's 16 rounds of queueing, so that's for small
+-- updates (HIDDEN pages). More than that is read in the terminal, with the
+-- scrolling briefly on screen (cap.plain).
+local HIDDEN = 3
+
+local function peek(action)
+  if cap.plain then
+    rift.exec_action(action)
+    run("TermScrollPeeked")
+    return
+  end
+  local term = { buf = view.term }
+  rift.switch_buf(view.term)
+  rift.annotations.clear(PEEK, term)
+  rift.annotations.add({ kind = PEEK, range = { 0, 10000000 }, buf = view.term })
+  rift.exec_action(action)
+  run("TermScrollPeeked") -- in case the hook didn't run
+end
+
 -- The visible screen. Trailing spaces go: rift pads the cursor's line.
 local function read_screen()
   local lines = rift.get_lines(1, -1)
-  for i, l in ipairs(lines) do lines[i] = l:gsub("%s+$", "") end
+  for i, l in ipairs(lines) do lines[i] = (l:gsub("%s+$", "")) end
   return lines
 end
 
@@ -114,47 +152,38 @@ local function shifted(old, new, k)
   return true
 end
 
--- Queues `n` pages, each followed by `step`. Reads only see a scroll once
--- it has been applied, and `:lua` refreshes them. The pages are queued up
--- front because rift allows only 16 rounds of queueing from one key press;
--- each batch is bigger than the last so the whole history fits.
-local function queue_pages(dir, n, step, after)
-  for _ = 1, n do
-    rift.exec_action(dir < 0 and cap.up or cap.down)
-    run(step)
-  end
-  run(after)
-end
+local function copy(t) return table.move(t, 1, #t, 1, {}) end
 
--- Called after each page. cap.done: this page didn't move the screen, so it's
--- at the end. A screen that repeats every page (`yes` output, say) looks the
--- same either way, so then we can't tell and keep going.
-local function page()
-  if not cap then return end
+-- The terminal is synced and active: read it, then go back.
+function M._peeked()
+  if not cap or not view or rift.current_buf() ~= view.term then return end
   local old, new = cap.screen, read_screen()
+  local row, col = rift.get_cursor()
+  if not cap.plain then
+    rift.annotations.clear(PEEK, { buf = view.term })
+    rift.switch_buf(view.buf)
+  end
   cap.screen = new
+  cap.row, cap.col = row, col
+
+  -- cap.done: this page didn't move the screen, so it's at the end. A screen
+  -- that repeats every page (`yes` output, say) looks the same either way,
+  -- so then we can't tell and keep going.
+  cap.done = false
+  if not old then return end
   if shifted(old, new, 0) then
     if shifted(old, new, cap.size) then
       cap.repeats = cap.repeats + 1
     else
       cap.done = true
     end
-    return old, new, true
+    return
   end
-  cap.done = false
-  return old, new, false
-end
-
-function M._page_down() page() end
-
-function M._page_up()
-  local old, new, same = page()
-  if not old or same then return end
+  if cap.phase ~= "up" then return end
   -- Repeating pages we passed were real, now that there's more above them.
   for _ = 1, cap.repeats do
     for i = cap.size, 1, -1 do cap.rev[#cap.rev + 1] = old[i] end
   end
-  cap.pages = cap.pages + cap.repeats + 1
   cap.repeats = 0
   -- The last page before the top can be a short one.
   local k = cap.size
@@ -163,130 +192,273 @@ function M._page_up()
   for i = k, 1, -1 do cap.rev[#cap.rev + 1] = new[i] end
 end
 
--- First get to the bottom, in case the terminal was already scrolled up.
-function M._down_done()
-  if not cap then return end
-  if not cap.done and cap.queued < cap.max then
-    local n = math.min(cap.queued * 8, cap.max)
-    cap.queued = cap.queued + n
-    return queue_pages(1, n, "TermScrollPageDown", "TermScrollDownDone")
-  end
-  -- At the bottom the cursor is the shell's own.
-  cap.bottom = cap.screen
-  cap.prompt = rift.get_cursor()
-  cap.done, cap.repeats, cap.queued = false, 0, 4
-  queue_pages(-1, 4, "TermScrollPageUp", "TermScrollUpDone")
+-- Queues `n` pages, then the next step. They're queued up front because rift
+-- allows only 16 rounds of queueing at a time; each batch is bigger than the
+-- last, so the whole history fits.
+local function pages(action, n)
+  cap.queued = cap.queued + n
+  if cap.plain then rift.switch_buf(view.term) end
+  for _ = 1, n do peek(action) end
+  run("TermScrollStep")
 end
 
-function M._up_done()
-  if not cap then return end
-  if not cap.done and cap.queued < cap.max then
-    local n = math.min(cap.queued * 2, cap.max)
-    cap.queued = cap.queued + n
-    return queue_pages(-1, n, "TermScrollPageUp", "TermScrollUpDone")
-  end
-
-  local c = cap
-  cap = nil
-  -- Put the terminal back at the bottom for when we return to it.
-  for _ = 1, c.pages + c.repeats do rift.exec_action(c.down) end
-
-  local lines = {}
-  for i = #c.rev, 1, -1 do lines[#lines + 1] = c.rev[i] end
-  local above = #lines
-  -- Skip the empty screen below the prompt.
-  local last = #c.bottom
-  while last > c.prompt and c.bottom[last] == "" do last = last - 1 end
-  for i = 1, last do lines[#lines + 1] = c.bottom[i] end
-
-  -- Show what was on screen: find it, newest first.
-  local top, row, col = above, above + c.prompt, c.col
-  if not shifted(c.start, c.bottom, 0) then
-    for t = above, 0, -1 do
-      local same = true
-      for i = 1, #c.start do
-        if (lines[t + i] or "") ~= c.start[i] then
-          same = false
-          break
-        end
-      end
-      if same then
-        top, row, col = t, math.min(t + #c.start, #lines), 0
+-- How many of the lines just read are new history, given what we had: the
+-- older ones must match the end of `hist`. nil if more has to be read.
+local function new_lines(hist, rev, prev)
+  local c = #rev -- rev[1] is the newest
+  local found
+  for d = 0, c do
+    local overlap = math.min(c - d, #hist)
+    if c - d > #hist and not cap.top then break end
+    if overlap < math.min(8, #hist) then break end
+    local same = c - d <= #hist
+    for i = 1, overlap do
+      if rev[d + i] ~= hist[#hist - i + 1] then
+        same = false
         break
       end
     end
-  end
-
-  -- A copy of this terminal left open earlier is out of date.
-  for view, term in pairs(views) do
-    if term == c.term then
-      views[view] = nil
-      for _, b in ipairs(rift.get_buf_list()) do
-        if b.id == view then rift.close_buf(true, { buf = view }) end
+    if same then
+      -- Lines that scrolled off were the top of the screen before, so prefer
+      -- the count for which they still read the same.
+      local match = true
+      for i = 1, math.min(d, #prev) do
+        if rev[d - i + 1] ~= prev[i] then
+          match = false
+          break
+        end
       end
+      if match then return d end
+      found = found or d
     end
   end
-
-  local view = rift.create_scratch_buf("terminal history", lines)
-  views[view] = c.term
-  -- Line numbers would push full-width lines past the edge of the window.
-  rift.set_option("number", "off", { buf = view })
-  rift.set_cursor(row, col, { buf = view })
-  rift.set_scroll(top, 0)
+  return found
 end
 
--- Alt+a in a terminal.
-function M.open()
-  if rift.buf_kind() ~= "terminal" then return end
-  local screen = read_screen()
-  local _, col = rift.get_cursor()
-  local big = #screen >= 20
+-- Puts `lines` in the copy, changing only what's different, and keeps the
+-- cursor where it was (or at the end, if it was on the last line).
+local function show(lines, row, col)
+  local opts = { buf = view.buf }
+  local old = view.lines
+  local count = rift.get_line_count(opts)
+  if count ~= #old then old = rift.get_lines(1, -1, opts) end -- it was edited
+  local first = 1
+  while first <= #old and first <= #lines and old[first] == lines[first] do
+    first = first + 1
+  end
+  local last_old, last_new = #old, #lines
+  while last_old >= first and last_new >= first and old[last_old] == lines[last_new] do
+    last_old, last_new = last_old - 1, last_new - 1
+  end
+  local changed = last_old >= first or last_new >= first
+  if changed then
+    -- Replace at least one line on each side, so it's never a pure insert
+    -- or delete.
+    if last_old < first or last_new < first then
+      if first > 1 then
+        first = first - 1
+      else
+        last_old, last_new = last_old + 1, last_new + 1
+      end
+    end
+    local r, c = rift.get_cursor(opts)
+    local follow = r >= #old
+    rift.replace_lines(first, last_old, table.move(lines, first, last_new, 1, {}), opts)
+    if view.fresh or follow then r, c = row, col end
+    rift.set_cursor(math.min(r, #lines), c, opts)
+  end
+  view.lines = lines
+end
+
+local function pause(ms)
+  if hold then rift.timer_stop(hold) end
+  hold = rift.timer(ms, function() hold = nil end)
+end
+
+local function finish()
+  local c = cap
+  cap = nil
+  local v = view
+  if c.plain then
+    rift.switch_buf(v.buf)
+    if not v.fresh then pause(500) end -- lots of output: don't flash too often
+  end
+  -- Skip the empty screen below the prompt.
+  local screen = c.bottom
+  local last = #screen
+  while last > c.prompt and screen[last] == "" do last = last - 1 end
+  local lines = copy(v.hist)
+  for i = 1, last do lines[#lines + 1] = screen[i] end
+  local row, col = #v.hist + c.prompt, c.prompt_col
+
+  if v.fresh then
+    local top = #v.hist
+    row, col = top + v.row, v.col
+    -- If the terminal was scrolled up, show the same place: newest first.
+    if not shifted(v.start, screen, 0) then
+      for t = top, 0, -1 do
+        local same = true
+        for i = 1, #v.start do
+          if (lines[t + i] or "") ~= v.start[i] then
+            same = false
+            break
+          end
+        end
+        if same then
+          top, row = t, t + v.row
+          break
+        end
+      end
+    end
+    show(lines, row, col)
+    rift.set_scroll(top, 0)
+    v.fresh = false
+  else
+    show(lines, row, col)
+  end
+  v.screen = screen
+end
+
+-- Runs after each batch of pages and decides what's next.
+function M._step()
+  local c = cap
+  if not c or not view then return end
+
+  if c.phase == "down" then
+    -- The first page is enough unless the terminal was scrolled up.
+    if view.fresh and not c.done and c.queued < c.max then
+      return pages(c.down, math.min(c.queued * 8, c.max))
+    end
+    -- At the bottom the cursor is the shell's own.
+    c.bottom, c.prompt, c.prompt_col = c.screen, c.row, c.col
+    if not c.bottom then
+      cap = nil
+      return
+    end
+    if not view.fresh and #c.bottom == #view.screen and shifted(view.screen, c.bottom, 0) then
+      cap = nil
+      return
+    end
+    c.phase, c.repeats, c.queued, c.done = "up", 0, 0, false
+    return pages(c.up, view.fresh and 4 or 1)
+  end
+
+  if c.phase == "up" then
+    c.top = c.done
+    local d = not view.fresh and new_lines(view.hist, c.rev, view.screen)
+    if not d and not c.top and c.queued < c.max then
+      local n = math.min(c.queued * 2, c.max)
+      if c.queued + n > HIDDEN then c.plain = true end
+      return pages(c.up, n)
+    end
+    if d then
+      for i = d, 1, -1 do view.hist[#view.hist + 1] = c.rev[i] end
+    elseif #c.rev > 0 or view.fresh then
+      -- First time, or it was resized: take it all again.
+      view.hist = {}
+      for i = #c.rev, 1, -1 do view.hist[#view.hist + 1] = c.rev[i] end
+    end -- else no history at all: cleared, or a full-screen program. Keep ours.
+    -- Put the terminal back at the bottom for when we return to it.
+    c.phase, c.repeats = "back", 0
+    local n = c.queued
+    return pages(c.down, n)
+  end
+
+  finish()
+end
+
+local function sync()
+  if cap or not view then return end
+  local big = #view.start >= 20
   local size = big and 20 or 5
   cap = {
-    term = rift.current_buf(),
+    phase = "down",
     size = size,
     up = big and "terminal:scroll_page_up" or "terminal:scroll_up",
     down = big and "terminal:scroll_page_down" or "terminal:scroll_down",
     max = math.ceil(HISTORY / size) + 1,
-    start = screen, screen = screen, col = col,
-    rev = {}, pages = 0, repeats = 0, queued = 1, done = false,
+    rev = {}, repeats = 0, queued = 0, done = false, plain = view.fresh,
   }
+  pages(cap.down, view.fresh and 2 or 1)
+end
+
+local function is_open(buf)
+  for _, b in ipairs(rift.get_buf_list()) do
+    if b.id == buf then return true end
+  end
+  return false
+end
+
+-- Only in Normal mode: a selection, a search or an operator shouldn't have
+-- text change under it.
+local function tick()
+  if not view then return end
+  if not is_open(view.buf) then
+    view, cap = nil, nil
+    return
+  end
+  if mode ~= "normal" or rift.current_buf() ~= view.buf then return end
+  if hold or not is_open(view.term) then return end
+  cap = nil
+  sync()
+end
+
+-- Alt+a in terminal-normal mode.
+function M.open()
+  if rift.buf_kind() ~= "terminal" then return end
+  local term = rift.current_buf()
+  local screen = read_screen()
+  local row, col = rift.get_cursor()
   rift.exec_action("terminal:exit")
-  queue_pages(1, 1, "TermScrollPageDown", "TermScrollDownDone")
+  if view and is_open(view.buf) then rift.close_buf(true, { buf = view.buf }) end
+  cap = nil
+  local buf = rift.create_scratch_buf("terminal history", screen)
+  view = {
+    buf = buf, term = term, start = screen, screen = screen,
+    lines = screen, hist = {}, fresh = true,
+    row = row, col = col, -- the cursor stays where it was
+  }
+  -- Line numbers would push full-width lines past the edge of the window.
+  rift.set_option("number", "off", { buf = buf })
+  rift.set_cursor(row, col, { buf = buf })
+  sync()
 end
 
 -- Back to the live terminal, ready to type.
 function M.back()
-  local view = rift.current_buf()
-  local term = views[view]
-  if not term then return end
-  for _, b in ipairs(rift.get_buf_list()) do
-    if b.id == term then
-      views[view] = nil
-      rift.exec_action("mode:normal")
-      rift.switch_buf(term)
-      rift.close_buf(true, { buf = view })
-      rift.exec_action("mode:insert")
-      return
-    end
-  end
+  if not view or rift.current_buf() ~= view.buf then return end
   rift.exec_action("mode:normal")
-  rift.notify("info", "That terminal has closed")
+  if not is_open(view.term) then
+    rift.notify("info", "That terminal has closed")
+    return
+  end
+  local v = view
+  view, cap = nil, nil
+  rift.switch_buf(v.term)
+  rift.close_buf(true, { buf = v.buf })
+  rift.exec_action("mode:insert")
 end
 
 local function setup_buffer(key)
-  rift.register_command("TermScrollPageDown", M._page_down, "rift-term-scroll internal")
-  rift.register_command("TermScrollPageUp", M._page_up, "rift-term-scroll internal")
-  rift.register_command("TermScrollDownDone", M._down_done, "rift-term-scroll internal")
-  rift.register_command("TermScrollUpDone", M._up_done, "rift-term-scroll internal")
+  rift.register_command("TermScrollPeeked", M._peeked, "rift-term-scroll internal")
+  rift.register_command("TermScrollStep", M._step, "rift-term-scroll internal")
   rift.register_command("TermScrollOpen", M.open, "Open the terminal's history as a buffer")
   rift.register_command("TermScrollBack", M.back, "Go back to the live terminal")
-  map("t", key, "TermScrollOpen")
   map("tn", key, "TermScrollOpen")
+  rift.annotations.on_enter(PEEK, M._peeked)
   -- However Insert mode is entered (i, a, o, c...), it goes back.
   rift.on("ModeChanged", function(ev)
-    if ev.to == "insert" and views[rift.current_buf()] then run("TermScrollBack") end
+    mode = ev.to
+    if not view or rift.current_buf() ~= view.buf then return end
+    if ev.to == "insert" then
+      run("TermScrollBack")
+    elseif ev.from:find("^visual") then
+      -- rift-clipboard copies a Visual yank a moment after Visual mode ends,
+      -- and not if the buffer changed in between.
+      pause(1000)
+    end
   end)
+  rift.timer(update_ms, tick, { ["repeat"] = true })
 end
 
 function M.setup(opts)
@@ -323,6 +495,7 @@ function M.setup(opts)
 
   local buffer_key = opts.buffer_key
   if buffer_key == nil then buffer_key = defaults.buffer_key end
+  update_ms = opts.update_ms or defaults.update_ms
   if buffer_key then setup_buffer(buffer_key) end
 end
 
